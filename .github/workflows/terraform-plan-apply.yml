@@ -1,0 +1,145 @@
+name: Terraform Plan & Apply
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        required: false
+        type: string
+        default: "."
+      terraform_version:
+        required: false
+        type: string
+        default: "1.9.0"
+      backend_config:
+        required: false
+        type: string
+        default: ""
+      var_file:
+        required: false
+        type: string
+        default: ""
+      environment:
+        required: true
+        type: string
+      auto_approve:
+        required: false
+        type: boolean
+        default: false
+      checkov_enabled:
+        required: false
+        type: boolean
+        default: true
+      checkov_skip_checks:
+        required: false
+        type: string
+        default: ""
+      aws_region:
+        required: false
+        type: string
+        default: "us-gov-west-1"
+      role_arn:
+        description: "IAM role ARN to assume via OIDC"
+        required: true
+        type: string
+      role_session_name:
+        required: false
+        type: string
+        default: "github-actions-terraform"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          role-session-name: ${{ inputs.role_session_name }}
+          aws-region: ${{ inputs.aws_region }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+      - name: Terraform Init
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform init ${{ inputs.backend_config }}
+      - name: Terraform Format Check
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform fmt -check -recursive
+      - name: Terraform Validate
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform validate
+      - name: Checkov scan
+        if: inputs.checkov_enabled
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.working_directory }}
+          framework: terraform
+          skip_check: ${{ inputs.checkov_skip_checks }}
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+      - name: Upload Checkov SARIF
+        if: inputs.checkov_enabled && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-results
+          path: checkov-results.sarif
+        continue-on-error: true
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          PLAN_ARGS=""
+          if [ -n "${{ inputs.var_file }}" ]; then
+            PLAN_ARGS="-var-file=${{ inputs.var_file }}"
+          fi
+          terraform plan $PLAN_ARGS -out=tfplan -detailed-exitcode || echo "exitcode=$?" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working_directory }}/tfplan
+      - name: Plan summary
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform show tfplan -no-color >> $GITHUB_STEP_SUMMARY
+
+  apply:
+    needs: plan
+    if: needs.plan.outputs.plan_exit_code == '2'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.auto_approve && inputs.environment || format('{0}-approval', inputs.environment) }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          role-session-name: ${{ inputs.role_session_name }}
+          aws-region: ${{ inputs.aws_region }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working_directory }}
+      - name: Terraform Init
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform init ${{ inputs.backend_config }}
+      - name: Terraform Apply
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform apply -auto-approve tfplan

@@ -1,0 +1,140 @@
+name: SAST & DAST Security Scanning
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        required: true
+        type: string
+      sast_enabled:
+        required: false
+        type: boolean
+        default: true
+      dast_enabled:
+        required: false
+        type: boolean
+        default: false
+      dast_target_url:
+        required: false
+        type: string
+        default: ""
+      dependency_scan:
+        required: false
+        type: boolean
+        default: true
+      secret_scan:
+        required: false
+        type: boolean
+        default: true
+      fail_on_severity:
+        required: false
+        type: string
+        default: "high"
+    outputs:
+      sast_result:
+        value: ${{ jobs.sast.outputs.result }}
+      dast_result:
+        value: ${{ jobs.dast.outputs.result }}
+
+jobs:
+  secret-detection:
+    if: inputs.secret_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  dependency-scan:
+    if: inputs.dependency_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+        continue-on-error: true
+      - name: Trivy SARIF
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: dependency-results.sarif
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-scan-results
+          path: dependency-results.sarif
+
+  sast:
+    if: inputs.sast_enabled
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.semgrep.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/owasp-top-ten
+            p/security-audit
+            p/${{ inputs.language }}
+          generateSarif: true
+        continue-on-error: true
+      - if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+        continue-on-error: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results
+          path: semgrep.sarif
+
+  dast:
+    if: inputs.dast_enabled && inputs.dast_target_url != ''
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.zap.outcome }}
+    steps:
+      - id: zap
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ inputs.dast_target_url }}
+          cmd_options: "-a"
+          allow_issue_writing: false
+        continue-on-error: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-results
+          path: report_html.html
+
+  gate:
+    needs: [secret-detection, dependency-scan, sast]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Security gate
+        run: |
+          echo "=== Security Gate ==="
+          echo "Secrets: ${{ needs.secret-detection.result }}"
+          echo "Dependencies: ${{ needs.dependency-scan.result }}"
+          echo "SAST: ${{ needs.sast.result }}"
+          if [ "${{ needs.secret-detection.result }}" = "failure" ]; then
+            echo "::error::Secrets detected!" && exit 1
+          fi
+          echo "Security gate passed"

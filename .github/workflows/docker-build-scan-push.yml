@@ -1,0 +1,148 @@
+name: Docker Build, Scan & Push
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Docker image name"
+        required: true
+        type: string
+      dockerfile:
+        required: false
+        type: string
+        default: "Dockerfile"
+      context:
+        required: false
+        type: string
+        default: "."
+      registry:
+        description: "ECR registry URL"
+        required: true
+        type: string
+      severity_threshold:
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      scan_only:
+        required: false
+        type: boolean
+        default: false
+      platforms:
+        required: false
+        type: string
+        default: "linux/amd64"
+      aws_region:
+        required: false
+        type: string
+        default: "us-gov-west-1"
+      role_arn:
+        description: "IAM role ARN to assume via OIDC"
+        required: true
+        type: string
+    outputs:
+      image_digest:
+        value: ${{ jobs.build-scan-push.outputs.digest }}
+      image_tag:
+        value: ${{ jobs.build-scan-push.outputs.tag }}
+      scan_result:
+        value: ${{ jobs.build-scan-push.outputs.scan_result }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tag: ${{ steps.meta.outputs.version }}
+      scan_result: ${{ steps.scan.outcome }}
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          role-session-name: github-actions-docker
+          aws-region: ${{ inputs.aws_region }}
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ inputs.image_name }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify image
+        run: docker inspect ${{ inputs.registry }}/${{ inputs.image_name }}:${{ steps.meta.outputs.version }} | jq '.[0] | {Id, Created, Size, Os, Architecture}'
+      - name: Trivy vulnerability scan
+        id: scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.registry }}/${{ inputs.image_name }}:${{ steps.meta.outputs.version }}
+          format: table
+          exit-code: 1
+          severity: ${{ inputs.severity_threshold }}
+          output: trivy-report.txt
+        continue-on-error: true
+      - name: Trivy SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.registry }}/${{ inputs.image_name }}:${{ steps.meta.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-results
+          path: |
+            trivy-report.txt
+            trivy-results.sarif
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+      - name: Gate check
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error::Trivy found vulnerabilities at severity: ${{ inputs.severity_threshold }}"
+          cat trivy-report.txt
+          exit 1
+      - name: Push image
+        id: push
+        if: ${{ !inputs.scan_only && steps.scan.outcome == 'success' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

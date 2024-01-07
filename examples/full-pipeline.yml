@@ -1,0 +1,39 @@
+name: Build & Deploy App
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+jobs:
+  docker:
+    uses: rahulreddy0120/gh-reusable-workflow-templates/.github/workflows/docker-build-scan-push.yml@main
+    with:
+      image_name: my-api
+      registry: 641665640867.dkr.ecr.us-gov-west-1.amazonaws.com
+      role_arn: arn:aws-us-gov:iam::641665640867:role/github-actions-ecr-role
+      scan_only: ${{ github.event_name == 'pull_request' }}
+
+  security:
+    uses: rahulreddy0120/gh-reusable-workflow-templates/.github/workflows/sast-dast-scan.yml@main
+    with:
+      language: python
+
+  terraform:
+    needs: [docker, security]
+    uses: rahulreddy0120/gh-reusable-workflow-templates/.github/workflows/terraform-plan-apply.yml@main
+    with:
+      working_directory: terraform
+      environment: dev
+      role_arn: arn:aws-us-gov:iam::641665640867:role/github-actions-terraform-role
+
+  tag-audit:
+    needs: [terraform]
+    uses: rahulreddy0120/gh-reusable-workflow-templates/.github/workflows/aws-tag-compliance.yml@main
+    with:
+      role_arn: arn:aws-us-gov:iam::641665640867:role/github-actions-readonly-role
+      enforce: true
